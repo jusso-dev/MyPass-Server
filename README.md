@@ -3,11 +3,33 @@
 [![CI](https://github.com/jusso-dev/MyPass-Server/actions/workflows/ci.yml/badge.svg)](https://github.com/jusso-dev/MyPass-Server/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-A zero-knowledge encrypted card relay server. Written in Rust with Axum, backed by PostgreSQL.
+> **The backend for [MyPass](https://github.com/jusso-dev/MyPass) — a way for parents and carers of autistic children to tell their child's story once, share it with the people who need to know, and take it back whenever they want.**
 
-The server is a **dumb blob relay**: it stores encrypted profile cards, wrapped encryption keys, and push tokens, but **never sees plaintext**. All encryption and decryption happens on-device. There are no user accounts, no PII, and no JWTs. Identity is a device keypair.
+This is the relay server. **It can't read your child's card.** It holds ciphertext, wrapped keys, and ownership hashes — nothing else.
 
-It was built as the backend for the [MyPass iOS app](https://github.com/jusso-dev/MyPass), a family-facing app for sharing autism awareness profile cards with carers, teachers, and first responders.
+## The story
+
+Families of autistic children explain the same things over and over: how their child communicates, what overwhelms them, what calms them, what's safe to eat, who to call in a crisis. New teacher, new term — same email. New respite carer — same conversation. New paramedic at the door — and there is no time to explain anything.
+
+[MyPass](https://github.com/jusso-dev/MyPass) lets a family write the card once and share it on their terms:
+
+- **Share with someone known** by device ID — for partners, grandparents, long-term carers.
+- **Share with someone new** by generating a QR code with a built-in expiry — five minutes for an appointment, a week for a respite stay, a month for a school term.
+- **Revoke instantly** when a relationship ends, then rotate the card key so cached ciphertext on revoked devices becomes unreadable.
+
+This server makes that work without ever seeing the card itself.
+
+## Why "zero-knowledge"
+
+The server is **assumed compromisable**. The threat model is built so a fully-compromised server still cannot read user data.
+
+- The card is **encrypted on the family's device** with a random AES-256-GCM key.
+- The server only stores the ciphertext, the wrapped keys (one per subscriber, wrapped with their ECDH-P256 public key), and an HMAC hash of the owner's secret.
+- The owner's raw secret never leaves the iOS Keychain.
+- Share-link decryption keys live in the **URL fragment** (`#key`) — fragments are never sent to the server by browsers or HTTP clients, so the server never sees the key even when redeeming a link.
+- There are no accounts. No emails. No passwords. No usernames. Identity is a P-256 device keypair held in the Secure Enclave.
+
+A breach of the server gets the attacker a pile of opaque blobs.
 
 ## Architecture
 
@@ -15,18 +37,19 @@ It was built as the backend for the [MyPass iOS app](https://github.com/jusso-de
 +------------+         +-----------------+         +--------------+
 |  iOS app   | ──API──>│  MyPass Server  │ ──SQL──>│ PostgreSQL   │
 |  (encrypt  │         │  (blob relay,   │         │ (ciphertext  │
-|   + decrypt│<──push──│   ECDH keywrap, │         │   storage)   │
+|   + decrypt│<──push──│   ECDH keywrap, │         │   only)      │
 |   on device│         │   share links)  │         │              │
 +------------+         +-----------------+         +--------------+
 ```
 
-**Design decisions**
+The server's job is narrow:
 
-- **No accounts** — identity is a P-256 device keypair (Secure Enclave / Android Keystore)
-- **Ownership proof** — HMAC-SHA256 of a client-generated 32-byte secret stored in the device Keychain
-- **Client-side encryption** — AES-256-GCM; server only stores opaque ciphertext
-- **Key exchange** — ECDH-P256: owner wraps the card's AES key with each subscriber's public key
-- **Share links** — random URL-safe token + decryption key in URL fragment (never sent to server)
+1. **Devices register** with a P-256 public key. Server issues a nanoid; that's the device identity.
+2. **Owners create cards** by uploading ciphertext + an HMAC-hashed ownership secret.
+3. **Owners share** by creating a subscription with an ECDH-wrapped copy of the card key, scoped to one subscriber's public key.
+4. **Owners generate share links** — random URL-safe tokens with a `max_uses` and `expires_at`. The decryption key never touches the server.
+5. **Subscribers fetch** the card by device ID (or by redeeming a link). The server returns ciphertext; the device unwraps the key locally.
+6. **Owners revoke** by deleting subscriptions and rotating the card key in a single atomic transaction.
 
 ## Tech stack
 
@@ -36,7 +59,7 @@ It was built as the backend for the [MyPass iOS app](https://github.com/jusso-de
 | Web framework | Axum 0.8 |
 | Async runtime | Tokio (multi-threaded) |
 | Database | PostgreSQL 16+ via SQLx (compile-time-checked queries) |
-| Crypto | `hmac`, `sha2` (HMAC-SHA256 owner verification); `jsonwebtoken` (FCM service-account JWT) |
+| Crypto | `hmac` + `sha2` for ownership; `jsonwebtoken` for FCM service-account JWTs |
 | HTTP middleware | tower-http (CORS, tracing, gzip, timeouts, security headers) |
 | Rate limiting | tower_governor 0.8 (per-peer-IP token bucket) |
 | Push notifications | Firebase Cloud Messaging v1 (optional, env-gated) |
@@ -73,27 +96,24 @@ See [SECURITY.md](SECURITY.md) for the full threat model and reporting policy.
 ### Local development
 
 ```bash
-# Copy env template and fill in required values
 cp .env.example .env
 
 # Generate a strong HMAC key
 openssl rand -hex 32   # paste into HMAC_KEY in .env
 
-# Run migrations and start the server
 cargo run
 ```
 
 ### Docker Compose
 
 ```bash
-# Set required secrets in .env first
 echo "POSTGRES_PASSWORD=$(openssl rand -hex 16)" >> .env
 echo "HMAC_KEY=$(openssl rand -hex 32)" >> .env
 
 docker compose up
 ```
 
-The server listens on `:3000` and the database is reachable only from inside the Compose network.
+Server listens on `:3000`. Database is only reachable from inside the Compose network.
 
 ## Configuration
 
@@ -108,7 +128,7 @@ The server listens on `:3000` and the database is reachable only from inside the
 | `FCM_CLIENT_EMAIL` | no | — | Service account email |
 | `FCM_PRIVATE_KEY` | no | — | Service account private key, PEM (use `\n` for newlines) |
 
-If any FCM variable is missing, push notifications become no-ops (logged as warnings) — the rest of the API works normally.
+If any FCM variable is missing, push notifications become no-ops (warning logged) — the rest of the API works normally.
 
 ## API reference
 
@@ -172,7 +192,7 @@ Four tables, no PII:
 - **`devices`** — nanoid id, P-256 public key, optional push token
 - **`cards`** — encrypted blob (Base64 AES-GCM ciphertext + IV + auth tag), HMAC-hashed owner secret, version counter
 - **`card_subscriptions`** — ECDH-wrapped card key per subscriber, role, optional expiry, fetch tracking
-- **`share_links`** — random URL-safe token, role, max_uses, expires_at
+- **`share_links`** — random URL-safe token, role, `max_uses`, `expires_at`
 
 A background task runs every 5 minutes to purge expired share links and subscriptions. Cascading FKs handle delete-time cleanup.
 
