@@ -1,0 +1,46 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: mypass
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: mypass
+    # No port mapping — the DB is only reachable from the `server` container.
+    # Uncomment for local dev if you need to connect from the host:
+    # ports:
+    #   - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mypass"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  server:
+    build: .
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:3000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://mypass:${POSTGRES_PASSWORD:?}@db:5432/mypass
+      HMAC_KEY: ${HMAC_KEY:?set HMAC_KEY in .env (openssl rand -hex 32)}
+      PORT: "3000"
+      RUST_LOG: ${RUST_LOG:-mypass_server=info,tower_http=info}
+      CORS_ORIGIN: ${CORS_ORIGIN:-}
+      FCM_PROJECT_ID: ${FCM_PROJECT_ID:-}
+      FCM_CLIENT_EMAIL: ${FCM_CLIENT_EMAIL:-}
+      FCM_PRIVATE_KEY: ${FCM_PRIVATE_KEY:-}
+    restart: unless-stopped
+
+volumes:
+  pgdata:
